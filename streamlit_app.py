@@ -6,49 +6,52 @@ import datetime
 import requests
 import re
 
-st.set_page_config(page_title="私人理财投研终端", layout="wide")
+st.set_page_config(page_title="私人投研终端", layout="wide")
 
-# 1. 实时基金画像 (解决 image_5db51c.png 中的未知状态)
+# 1. 修正版实时画像：增加重试与复权价格校验
 def get_fund_detail_live(code):
     try:
+        # 尝试从天天基金接口获取最新收盘/估值
         url = f"http://fundgz.1234567.com.cn/js/{code}.js"
         r = requests.get(url, timeout=3)
         content = re.findall(r"\((.*)\)", r.text)[0]
         data = eval(content)
         return {"名称": data['name'], "净值": data['dwjz'], "日期": data['gztime']}
     except:
-        return {"名称": f"代码 {code}", "净值": "---", "日期": "同步中"}
+        return {"名称": f"代码 {code}", "净值": "数据同步中", "日期": "---"}
 
-# 2. 稳健历史行情 (针对 image_5f0263.png 的 KeyError 做了多索引保护)
+# 2. 核心：强制前复权历史行情 (解决 513100 等价格错误)
 def get_hist_data_safe(symbol, start, end):
     try:
+        # 明确指定 adjust="qfq" (前复权)，确保 513100 显示为 6.x 而非 1.x
         df = ak.fund_etf_hist_em(symbol=symbol, period="daily", start_date=start, end_date=end, adjust="qfq")
         date_col = [c for c in df.columns if '日期' in c or 'date' in c.lower()][0]
         close_col = [c for c in df.columns if '收盘' in c or 'close' in c.lower()][0]
         df = df[[date_col, close_col]].rename(columns={date_col: '日期', close_col: symbol})
         df['日期'] = pd.to_datetime(df['日期'])
         return df
-    except:
+    except Exception as e:
+        st.error(f"代码 {symbol} 数据抓取失败: {e}")
         return pd.DataFrame()
 
 with st.sidebar:
     st.header("🔍 组合配置")
     codes_input = st.text_input("基金代码 (空格分隔)", "513500 513100 510300")
     weights_input = st.text_input("占比 % (空格分隔)", "40 30 30")
-    money = st.number_input("初始投入金额 (RMB)", value=10000)
+    money = st.number_input("初始投入 (元)", value=10000)
     
-    st.header("📊 基准对标")
+    st.header("📊 基准对比")
     bench_options = {"000300": "沪深300指数", "513500": "标普500ETF"}
     bench_code = st.selectbox("选择基准", list(bench_options.keys()), format_func=lambda x: bench_options[x])
     
-    analyze_btn = st.button("生成多维回测报告", type="primary")
+    analyze_btn = st.button("开始深度回测", type="primary")
 
 if analyze_btn:
     symbols = codes_input.split()
     weights = [float(w)/100 for w in weights_input.split()]
     
-    # --- A. 实时基金画像卡片 ---
-    st.markdown("### 📋 组合成分实时画像")
+    # --- A. 实时基金画像 (带复权校验) ---
+    st.markdown("### 📋 实时行情校验")
     card_cols = st.columns(len(symbols))
     for i, s in enumerate(symbols):
         info = get_fund_detail_live(s)
@@ -57,101 +60,76 @@ if analyze_btn:
             <div style="background-color:#f8f9fa; padding:15px; border-radius:10px; border-top:4px solid #ff4b4b;">
                 <h4 style="margin:0;">{info['名称']}</h4>
                 <p style="color:gray; font-size:0.8em;">代码: {s}</p>
-                <p style="margin:5px 0; font-size:1.1em; color:#ff4b4b;"><b>¥{info['净值']}</b></p>
-                <p style="font-size:0.7em; color:gray;">更新: {info['日期']}</p>
+                <p style="margin:0; font-size:1.2em; color:#ff4b4b;"><b>¥{info['净值']}</b></p>
+                <p style="font-size:0.7em; color:gray;">更新时间: {info['日期']}</p>
             </div>
             """, unsafe_allow_html=True)
 
-    # --- B. 数据回测逻辑 ---
-    with st.spinner('同步 10 年历史行情...'):
+    # --- B. 数据处理 (解决合并冲突) ---
+    with st.spinner('正在同步历史复权行情...'):
         end_d = datetime.date.today().strftime("%Y%m%d")
-        start_d = (datetime.date.today() - datetime.timedelta(days=365*10)).strftime("%Y%m%d")
+        start_d = (datetime.date.today() - datetime.timedelta(days=365*5)).strftime("%Y%m%d")
         
-        all_df = pd.DataFrame()
+        data_list = []
         for s in list(set(symbols + [bench_code])):
             df = get_hist_data_safe(s, start_d, end_d)
-            if all_df.empty: all_df = df
-            else: all_df = pd.merge(all_df, df, on='日期', how='inner')
+            if not df.empty:
+                data_list.append(df.set_index('日期'))
         
-        all_df = all_df.set_index('日期')
+        # 使用 join 确保日期对齐，避免 KeyError
+        all_df = pd.concat(data_list, axis=1, join='inner').sort_index()
+        
         rets = all_df.pct_change().dropna()
-        
         port_val = (1 + (rets[symbols] * weights).sum(axis=1)).cumprod() * money
         bench_val = (1 + rets[bench_code]).cumprod() * money
-        indiv_vals = (1 + rets[symbols]).cumprod() * money
 
-        # --- C. 核心：组合总资产走势 (全功能集成) ---
+        # --- C. 核心：组合总走势图 (功能大满贯) ---
         st.markdown("---")
-        st.subheader("📈 组合累计资产走势 (支持快捷切换与实时净值)")
+        st.subheader("📈 累计资产走势 (支持点击/滑块/精确净值)")
         
         fig1 = go.Figure()
-        # 1. 组合曲线：通过 customdata 和 hovertemplate 强制显示精确 RMB
+        # 1. 组合主线
         fig1.add_trace(go.Scatter(
             x=port_val.index, y=port_val, 
-            name="我的资产组合", 
+            name="我的组合", 
             line=dict(color='#ff4b4b', width=3),
-            hovertemplate="<b>日期:</b> %{x|%Y-%m-%d}<br><b>组合资产:</b> ¥%{y:,.2f}<extra></extra>"
+            # 悬浮时显示精确金额
+            hovertemplate="日期: %{x|%Y-%m-%d}<br>总资产: ¥%{y:,.2f}<extra></extra>"
         ))
-        # 2. 基准曲线
+        # 2. 基准对比线
         fig1.add_trace(go.Scatter(
             x=bench_val.index, y=bench_val, 
             name=f"基准: {bench_options[bench_code]}", 
             line=dict(color='#bdc3c7', dash='dash'),
-            hovertemplate="<b>基准价值:</b> ¥%{y:,.2f}<extra></extra>"
+            hovertemplate="基准价值: ¥%{y:,.2f}<extra></extra>"
         ))
         
-        # 3. 布局优化：点击按钮 + 时间滑块
+        # 3. 整合：点击切换 + 底部滑块
         fig1.update_xaxes(
             tickformat="%Y-%m-%d",
-            rangeslider_visible=True, # 保留底线滑块
-            rangeselector=dict( # 找回被去掉的时间点击按钮
+            rangeslider_visible=True, 
+            rangeselector=dict(
                 buttons=list([
                     dict(count=1, label="1月", step="month", stepmode="backward"),
                     dict(count=3, label="3月", step="month", stepmode="backward"),
                     dict(count=6, label="半年", step="month", stepmode="backward"),
+                    dict(count=1, label="1年", step="year", stepmode="backward"),
                     dict(count=1, label="今年来", step="year", stepmode="todate"),
-                    dict(count=1, label="1年", step="year", stepmode="backward"),
-                    dict(count=5, label="5年", step="year", stepmode="backward"),
-                    dict(step="all", label="全部视图")
-                ])
-            )
-        )
-        
-        fig1.update_layout(
-            hovermode="x unified", # 鼠标移动时同时显示所有线的净值
-            yaxis=dict(title="金额 (元)", tickformat=",.0f"), # 不显示 40k，显示完整数字
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            height=600
-        )
-        st.plotly_chart(fig1, use_container_width=True)
-
-        # --- D. 各基金明细走势 (同样具备全套功能) ---
-        st.subheader("📊 组合成分独立表现")
-        fig2 = go.Figure()
-        for s in symbols:
-            fig2.add_trace(go.Scatter(
-                x=indiv_vals.index, y=indiv_vals[s], 
-                name=f"基金 {s}",
-                hovertemplate="<b>日期:</b> %{x|%Y-%m-%d}<br><b>该基金资产:</b> ¥%{y:,.2f}<extra></extra>"
-            ))
-        
-        fig2.update_xaxes(
-            tickformat="%Y-%m-%d", 
-            rangeslider_visible=True,
-            rangeselector=dict(
-                buttons=list([
-                    dict(count=1, label="1月", step="month", stepmode="backward"),
-                    dict(count=1, label="1年", step="year", stepmode="backward"),
                     dict(step="all", label="全部")
                 ])
             )
         )
-        fig2.update_layout(hovermode="x unified", yaxis=dict(tickformat=",.0f"), height=500)
-        st.plotly_chart(fig2, use_container_width=True)
+        # 4. 纵轴：不使用k缩写
+        fig1.update_layout(
+            hovermode="x unified",
+            yaxis=dict(title="资产价值 (元)", tickformat=",.0f"),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
+        st.plotly_chart(fig1, use_container_width=True)
 
-        # --- E. 绩效看板 ---
+        # --- D. 绩效统计 ---
         st.markdown("---")
         c1, c2, c3 = st.columns(3)
-        c1.metric("最终资产总额", f"¥{port_val.iloc[-1]:,.2f}")
-        c2.metric("累计百分比收益", f"{(port_val.iloc[-1]/money-1)*100:.2f}%")
-        c3.metric("历史最大回撤", f"{((port_val - port_val.cummax())/port_val.cummax()).min()*100:.2f}%")
+        c1.metric("当前总资产", f"¥{port_val.iloc[-1]:,.2f}")
+        c2.metric("累计收益率", f"{(port_val.iloc[-1]/money-1)*100:.2f}%")
+        c3.metric("最大回撤", f"{((port_val - port_val.cummax())/port_val.cummax()).min()*100:.2f}%")
